@@ -11,7 +11,9 @@ import {
   verifyAndParseRequest,
 } from "@copilot-extensions/preview-sdk";
 
+// In-memory user-to-thread mapping (for demo; use persistent storage for production)
 const userThreads = new Map<string, string>();
+
 const app = new Hono();
 
 app.get("/", (c) => {
@@ -62,17 +64,20 @@ app.post("/", async (c) => {
     try {
       stream.write(createAckEvent());
 
+      // Identify the user
       const octokit = new Octokit({ auth: tokenForUser });
       const user = await octokit.request("GET /user");
       const userLogin = user.data.login;
       const userPrompt = getUserMessage(payload);
 
+      // Get or create thread ID for this user
       let threadId = userThreads.get(userLogin);
       if (!threadId) {
+        // Create thread via LangGraph API
         const threadResponse = await fetch("http://localhost:2024/threads", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({}), // (Add any required initial data here)
         });
         if (!threadResponse.ok) {
           const errText = await threadResponse.text();
@@ -80,6 +85,7 @@ app.post("/", async (c) => {
           throw new Error(`Failed to create thread: ${errText}`);
         }
         const threadData = await threadResponse.json();
+        // Use the correct property from your backend: thread_id, id, or uuid
         threadId = threadData.thread_id || threadData.id || threadData.uuid;
         if (!threadId) {
           throw new Error("Thread creation response missing thread_id");
@@ -88,6 +94,7 @@ app.post("/", async (c) => {
       }
 
       const assistantId = "agent";
+
       const endpoint = `http://localhost:2024/threads/${threadId}/runs/stream`;
 
       const langGraphResponse = await fetch(endpoint, {
@@ -121,71 +128,80 @@ app.post("/", async (c) => {
 
       const reader = langGraphResponse.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = "";
-      let hasValidContent = false;
-
-      stream.write(createTextEvent(`Hi ${userLogin}!\n\n`));
-
       let done = false;
+      let buffer = "";
+
+      stream.write(createTextEvent(`Hi ${userLogin}! `));
+
       while (!done) {
         const { value, done: streamDone } = await reader.read();
-        done = streamDone;
-
         if (value) {
-          const chunk = decoder.decode(value, { stream: true });
-          buffer += chunk;
-
-          // Split on lines and process
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-          for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-
-            // Look for data lines that contain JSON
-            if (line.startsWith('data: {')) {
+          buffer += decoder.decode(value, { stream: true });
+          // Process complete lines (SSE spec: events are separated by double newlines)
+          let lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (let line of lines) {
+            line = line.trim();
+            // Only process "event: values" lines (ignore heartbeats, metadata, etc.)
+            if (line.startsWith("event: values")) {
+              // Next line should have 'data: ...'
+              // Find the data line
+              let dataLine = line;
+              if (!dataLine.startsWith("data: ")) {
+                // If line isn't the data line, skip
+                continue;
+              }
+              const jsonPart = dataLine.slice(6); // after 'data: '
               try {
-                const jsonData = line.slice(6); // Remove 'data: ' prefix
-                const eventObj = JSON.parse(jsonData);
-
-                if (eventObj.messages && Array.isArray(eventObj.messages)) {
-                  for (const msg of eventObj.messages) {
-                    // Extract AI content without tool calls
-                    if (
-                      msg.type === "ai" &&
-                      msg.content &&
-                      typeof msg.content === 'string' &&
-                      msg.content.trim() &&
-                      (!msg.tool_calls || msg.tool_calls.length === 0)
-                    ) {
-                      stream.write(createTextEvent(msg.content));
-                      hasValidContent = true;
-                    }
+                const eventObj = JSON.parse(jsonPart);
+                const msgs = eventObj.messages ?? [];
+                for (const msg of msgs) {
+                  if (
+                    msg.type === "ai" &&
+                    msg.content &&
+                    (!msg.tool_calls || msg.tool_calls.length === 0)
+                  ) {
+                    stream.write(createTextEvent(msg.content));
                   }
                 }
-              } catch (parseError) {
-                // Ignore JSON parse errors - some data lines might not be valid JSON
-                console.error("JSON parse error (ignoring):", parseError.message);
+              } catch (e) {
+                console.error("Failed to parse values event data:", e, jsonPart);
+              }
+            } else if (line.startsWith("data: {") && buffer.length < 4096) {
+              // fallback: if raw data lines, try to parse JSON
+              try {
+                const eventObj = JSON.parse(line.slice(6));
+                const msgs = eventObj.messages ?? [];
+                for (const msg of msgs) {
+                  if (
+                    msg.type === "ai" &&
+                    msg.content &&
+                    (!msg.tool_calls || msg.tool_calls.length === 0)
+                  ) {
+                    stream.write(createTextEvent(msg.content));
+                  }
+                }
+              } catch (e) {
+                // Ignore parse errors
               }
             }
+            // Ignore heartbeats and other events
           }
         }
-      }
-
-      // If no valid content was streamed, provide a fallback
-      if (!hasValidContent) {
-        stream.write(createTextEvent("I received your request but couldn't generate a proper response. Please try again."));
+        done = streamDone;
       }
 
       stream.write(createDoneEvent());
-
     } catch (error) {
       console.error("Error processing Copilot extension request:", error);
       stream.write(
         createErrorsEvent([
           {
             type: "agent",
-            message: error instanceof Error ? error.message : JSON.stringify(error),
+            message:
+              error instanceof Error
+                ? error.message
+                : JSON.stringify(error),
             code: "PROCESSING_ERROR",
             identifier: "processing_error",
           },
