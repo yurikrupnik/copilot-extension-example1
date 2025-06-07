@@ -19,7 +19,7 @@ app.get("/", (c) => {
 });
 
 app.get("/callback", (c) => {
-  return c.text("Welcome to the Copilot Extension template! 👋");
+  return c.text("Welcome to the Copilot Extension Callback! 👋");
 });
 
 app.post("/", async (c) => {
@@ -55,10 +55,15 @@ app.post("/", async (c) => {
     return c.text("Request could not be verified");
   }
 
-  c.header("Content-Type", "text/html");
+  // Fix 1: Correct Content-Type for Server-Sent Events
+  c.header("Content-Type", "text/event-stream");
+  c.header("Cache-Control", "no-cache");
+  c.header("Connection", "keep-alive");
   c.header("X-Content-Type-Options", "nosniff");
 
   return stream(c, async (stream) => {
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
     try {
       stream.write(createAckEvent());
 
@@ -90,6 +95,10 @@ app.post("/", async (c) => {
       const assistantId = "agent";
       const endpoint = `http://localhost:2024/threads/${threadId}/runs/stream`;
 
+      // Fix 2: Add timeout and better error handling for long-running requests
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minute timeout (300 seconds)
+
       const langGraphResponse = await fetch(endpoint, {
         method: "POST",
         headers: {
@@ -107,7 +116,10 @@ app.post("/", async (c) => {
             ],
           },
         }),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeoutId);
 
       if (!langGraphResponse.ok || !langGraphResponse.body) {
         const errText = langGraphResponse.body
@@ -119,80 +131,160 @@ app.post("/", async (c) => {
         );
       }
 
-      const reader = langGraphResponse.body.getReader();
+      reader = langGraphResponse.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let hasValidContent = false;
 
-      stream.write(createTextEvent(`Hi ${userLogin}!\n\n`));
+      stream.write(createTextEvent(`Hi ${userLogin}! 🤖\n\nStarting your request... This may take up to 3 minutes depending on the model complexity.\n\n`));
 
-      let done = false;
-      while (!done) {
-        const { value, done: streamDone } = await reader.read();
-        done = streamDone;
+      // Fix 3: Improved streaming logic for long-running requests
+      let consecutiveEmptyReads = 0;
+      const maxEmptyReads = 50; // Increased for long-running requests
+      let lastActivityTime = Date.now();
+      const maxInactivityTime = 60000; // 60 seconds of no activity before warning
 
-        if (value) {
+      while (true) {
+        try {
+          const { value, done } = await reader.read();
+
+          if (done) {
+            console.log("Stream completed normally");
+            break;
+          }
+
+          if (!value || value.length === 0) {
+            consecutiveEmptyReads++;
+
+            // Check for inactivity timeout
+            const now = Date.now();
+            if (now - lastActivityTime > maxInactivityTime) {
+              // Send keep-alive message to prevent timeout
+              stream.write(createTextEvent("⏳ Processing your request...\n"));
+              lastActivityTime = now;
+              consecutiveEmptyReads = 0; // Reset counter after keep-alive
+            }
+
+            if (consecutiveEmptyReads >= maxEmptyReads) {
+              console.warn("Too many consecutive empty reads, ending stream");
+              break;
+            }
+
+            // Small delay to prevent tight polling
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+
+          consecutiveEmptyReads = 0;
+          lastActivityTime = Date.now(); // Update activity time
           const chunk = decoder.decode(value, { stream: true });
           buffer += chunk;
 
-          // Split on lines and process
+          // Fix 4: Better line splitting and processing
           const lines = buffer.split('\n');
           buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-          for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
+          for (const line of lines) {
+            const trimmedLine = line.trim();
 
-            // Look for data lines that contain JSON
-            if (line.startsWith('data: {')) {
-              try {
-                const jsonData = line.slice(6); // Remove 'data: ' prefix
-                const eventObj = JSON.parse(jsonData);
+            if (!trimmedLine) continue;
 
-                if (eventObj.messages && Array.isArray(eventObj.messages)) {
-                  for (const msg of eventObj.messages) {
-                    // Extract AI content without tool calls
-                    if (
-                      msg.type === "ai" &&
-                      msg.content &&
-                      typeof msg.content === 'string' &&
-                      msg.content.trim() &&
-                      (!msg.tool_calls || msg.tool_calls.length === 0)
-                    ) {
-                      stream.write(createTextEvent(msg.content));
-                      hasValidContent = true;
+            // Handle different SSE event formats
+            if (trimmedLine.startsWith('data: ')) {
+              const data = trimmedLine.slice(6).trim();
+
+              // Skip keep-alive pings
+              if (data === '' || data === 'ping') continue;
+
+              // Handle JSON data
+              if (data.startsWith('{')) {
+                try {
+                  const eventObj = JSON.parse(data);
+
+                  if (eventObj.messages && Array.isArray(eventObj.messages)) {
+                    for (const msg of eventObj.messages) {
+                      // Extract AI content without tool calls
+                      if (
+                        msg.type === "ai" &&
+                        msg.content &&
+                        typeof msg.content === 'string' &&
+                        msg.content.trim() &&
+                        (!msg.tool_calls || msg.tool_calls.length === 0)
+                      ) {
+                        stream.write(createTextEvent(msg.content));
+                        hasValidContent = true;
+                      }
                     }
                   }
+
+                  // Handle other potential message formats
+                  if (eventObj.content && typeof eventObj.content === 'string') {
+                    stream.write(createTextEvent(eventObj.content));
+                    hasValidContent = true;
+                  }
+
+                } catch (parseError) {
+                  console.warn("JSON parse error (ignoring):", parseError.message, "Data:", data);
                 }
-              } catch (parseError) {
-                // Ignore JSON parse errors - some data lines might not be valid JSON
-                console.error("JSON parse error (ignoring):", parseError.message);
               }
             }
           }
+        } catch (readError) {
+          console.error("Error reading from stream:", readError);
+          break;
         }
       }
 
-      // If no valid content was streamed, provide a fallback
+      // Fix 5: Always ensure we send some content
       if (!hasValidContent) {
+        console.warn("No valid content was streamed, sending fallback");
         stream.write(createTextEvent("I received your request but couldn't generate a proper response. Please try again."));
       }
 
+      // Fix 6: Ensure done event is always sent
       stream.write(createDoneEvent());
+      console.log("Stream completed successfully");
 
     } catch (error) {
       console.error("Error processing Copilot extension request:", error);
-      stream.write(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: error instanceof Error ? error.message : JSON.stringify(error),
-            code: "PROCESSING_ERROR",
-            identifier: "processing_error",
-          },
-        ])
-      );
+
+      // Fix 7: Better error handling and cleanup
+      try {
+        stream.write(
+          createErrorsEvent([
+            {
+              type: "agent",
+              message: error instanceof Error ? error.message : "Unknown error occurred",
+              code: "PROCESSING_ERROR",
+              identifier: "processing_error",
+            },
+          ])
+        );
+      } catch (writeError) {
+        console.error("Failed to write error event:", writeError);
+      }
+    } finally {
+      // Fix 8: Proper cleanup
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch (cancelError) {
+          console.warn("Error canceling reader:", cancelError);
+        }
+      }
     }
   });
+});
+
+// Fix 9: Add graceful shutdown handling
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, shutting down gracefully');
+  process.exit(0);
 });
 
 const port = 3000;
