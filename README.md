@@ -19,3 +19,5 @@ To get up and running with your development environment, see the [Development Gu
 ## Contributing
 
 Interested in contributing to the project? Check out the [Contributing guidlines](./CONTRIBUTING.md) and remember to respect the [Code of Conduct](./CODE-OF-CONDUCT.md).
+
+## License
